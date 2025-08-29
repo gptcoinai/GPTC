@@ -1,0 +1,255 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/*
+ * GPTC Presale (3 rounds)
+ * - Prices are in wei per 1 GPTC (18 decimals).
+ * - Each round has a BNB hard cap (in wei).
+ * - Auto-splits contribution across rounds; refunds leftover BNB.
+ * - Token budget caps the total GPTC sold; refunds if exceeded.
+ * - Instant delivery: presale holds GPTC and transfers on buy.
+ * - No third-party fees.
+ */
+
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v4.8.3/contracts/access/Ownable.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v4.8.3/contracts/security/ReentrancyGuard.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v4.8.3/contracts/security/Pausable.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v4.8.3/contracts/token/ERC20/IERC20.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v4.8.3/contracts/token/ERC20/utils/SafeERC20.sol";
+
+contract GPTCPresale is Ownable, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
+    struct Round {
+        uint256 priceWeiPerToken; // wei per 1 GPTC (18 decimals)
+        uint256 bnbCap;           // round cap in wei
+        uint256 bnbRaised;        // raised in wei
+        bool    closed;
+    }
+
+    IERC20  public immutable token;
+    address public treasury;              // менлив treasury
+    uint8   public currentRound;
+    Round[] public rounds;
+
+    uint256 public tokenBudget;           // вкупно GPTC дозволени за продажба (18 decimals)
+    uint256 public tokensSold;            // GPTC продадени (18 decimals)
+
+    mapping(address => uint256) public purchased;
+
+    event Purchased(address indexed buyer, uint256 bnbSpent, uint256 tokensOut, uint8 roundIndex);
+    event Refunded(address indexed buyer, uint256 bnbRefund);
+    event RoundAdvanced(uint8 newRound);
+    event TokensDeposited(uint256 amount);
+    event WithdrawBNB(address indexed to, uint256 amount);
+    event WithdrawUnsold(uint256 amount);
+    event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
+
+    constructor(
+        address _token,
+        address _treasury,
+        uint256 _tokenBudget,
+        uint256[3] memory _pricesWeiPerToken,
+        uint256[3] memory _bnbCapsWei
+    ) {
+        require(_token != address(0) && _treasury != address(0), "zero addr");
+        token       = IERC20(_token);
+        treasury    = _treasury;
+        tokenBudget = _tokenBudget;
+
+        // Ownable (v4.8.x): сетирај го деплојерот како сопственик
+        _transferOwnership(msg.sender);
+
+        for (uint8 i = 0; i < 3; i++) {
+            require(_pricesWeiPerToken[i] > 0 && _bnbCapsWei[i] > 0, "bad round");
+            rounds.push(Round({
+                priceWeiPerToken: _pricesWeiPerToken[i],
+                bnbCap: _bnbCapsWei[i],
+                bnbRaised: 0,
+                closed: false
+            }));
+        }
+        currentRound = 0;
+        _pause(); // стартува паузирано
+    }
+
+    // -----------------
+    // Admin
+    // -----------------
+    function unpause() external onlyOwner { _unpause(); }
+    function pause()  external onlyOwner { _pause(); }
+
+    function setTreasury(address newTreasury) external onlyOwner {
+        require(newTreasury != address(0), "zero addr");
+        address old = treasury;
+        treasury = newTreasury;
+        emit TreasuryUpdated(old, newTreasury);
+    }
+
+    function advanceRound() external onlyOwner {
+        require(currentRound < rounds.length, "no round");
+        rounds[currentRound].closed = true;
+        if (currentRound + 1 < rounds.length) {
+            currentRound++;
+        }
+        emit RoundAdvanced(currentRound);
+    }
+
+    // owner мора прво да approve() на GPTC кон овој контракт
+    function depositTokens(uint256 amount) external onlyOwner {
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        emit TokensDeposited(amount);
+    }
+
+    function withdrawBNB(uint256 amount) external onlyOwner {
+        require(address(this).balance >= amount, "insufficient BNB");
+        (bool ok, ) = payable(treasury).call{value: amount}("");
+        require(ok, "withdraw failed");
+        emit WithdrawBNB(treasury, amount);
+    }
+
+    function withdrawBNBTo(address to, uint256 amount) external onlyOwner {
+        require(to != address(0), "zero addr");
+        require(address(this).balance >= amount, "insufficient BNB");
+        (bool ok, ) = payable(to).call{value: amount}("");
+        require(ok, "withdraw failed");
+        emit WithdrawBNB(to, amount);
+    }
+
+    function withdrawUnsold(uint256 amount) external onlyOwner {
+        token.safeTransfer(msg.sender, amount);
+        emit WithdrawUnsold(amount);
+    }
+
+    // -----------------
+    // Views
+    // -----------------
+    function roundsLength() external view returns (uint256) { return rounds.length; }
+
+    function getRound(uint8 idx) external view returns (
+        uint256 priceWeiPerToken,
+        uint256 bnbCap,
+        uint256 bnbRaised,
+        bool closed
+    ) {
+        Round memory r = rounds[idx];
+        return (r.priceWeiPerToken, r.bnbCap, r.bnbRaised, r.closed);
+    }
+
+    // хелпер за пресметка пред купување (само view симулација)
+    function quote(uint256 bnbIn) external view returns (uint256 tokensOut, uint256 bnbUsed, uint256 bnbRefund) {
+        if (currentRound >= rounds.length) return (0, 0, bnbIn);
+        uint256 remainingBudget = tokenBudget - tokensSold;
+        if (bnbIn == 0 || remainingBudget == 0) return (0, 0, bnbIn);
+
+        uint256 bnbLeft = bnbIn;
+        uint8 idx = currentRound;
+
+        while (bnbLeft > 0 && idx < rounds.length && remainingBudget > 0) {
+            Round memory r = rounds[idx];
+            if (r.closed || r.bnbRaised >= r.bnbCap) { idx++; continue; }
+
+            uint256 roundRemainingBNB = r.bnbCap - r.bnbRaised;
+            uint256 takeBNB = bnbLeft <= roundRemainingBNB ? bnbLeft : roundRemainingBNB;
+
+            uint256 t = (takeBNB * 1e18) / r.priceWeiPerToken;
+            if (t > remainingBudget) t = remainingBudget;
+            if (t == 0) break;
+
+            uint256 takeBNBExact = (t * r.priceWeiPerToken) / 1e18;
+
+            bnbLeft    -= takeBNBExact;
+            bnbUsed    += takeBNBExact;
+            tokensOut  += t;
+            remainingBudget -= t;
+
+            if (r.bnbRaised + takeBNBExact == r.bnbCap) { idx++; }
+        }
+        bnbRefund = bnbLeft;
+    }
+
+    // -----------------
+    // Buy (MetaMask или direct send)
+    // -----------------
+    receive() external payable nonReentrant whenNotPaused {
+        _buy(msg.sender);
+    }
+
+    function buy() external payable nonReentrant whenNotPaused {
+        _buy(msg.sender);
+    }
+
+    function _buy(address beneficiary) internal {
+        require(beneficiary != address(0), "bad beneficiary");
+        require(msg.value > 0, "no BNB");
+        require(currentRound < rounds.length, "sale ended");
+
+        uint256 remainingBudget = tokenBudget - tokensSold;
+        require(remainingBudget > 0, "sold out");
+
+        uint256 bnbLeft        = msg.value;
+        uint256 totalTokensOut = 0;
+        uint256 totalBnbUsed   = 0;
+        uint8 idx              = currentRound;
+
+        while (bnbLeft > 0 && idx < rounds.length && remainingBudget > 0) {
+            Round storage r = rounds[idx];
+
+            if (r.closed || r.bnbRaised >= r.bnbCap) {
+                if (idx == currentRound && currentRound + 1 < rounds.length) currentRound++;
+                idx++;
+                continue;
+            }
+
+            uint256 roundRemainingBNB = r.bnbCap - r.bnbRaised;
+            uint256 takeBNB = bnbLeft <= roundRemainingBNB ? bnbLeft : roundRemainingBNB;
+
+            // пресметај токени за takeBNB
+            uint256 tokensAtTake = (takeBNB * 1e18) / r.priceWeiPerToken;
+
+            // сечи според преостанатиот буџет
+            if (tokensAtTake > remainingBudget) {
+                tokensAtTake = remainingBudget;
+            }
+            require(tokensAtTake > 0, "amount too small");
+
+            // усогласи точно колку BNB трошиме за тие токени
+            uint256 takeBNBExact = (tokensAtTake * r.priceWeiPerToken) / 1e18;
+            if (takeBNBExact > bnbLeft) takeBNBExact = bnbLeft;
+
+            // доволно токени во пресале?
+            require(token.balanceOf(address(this)) >= totalTokensOut + tokensAtTake, "insufficient GPTC");
+
+            // апдејти
+            bnbLeft        -= takeBNBExact;
+            totalBnbUsed   += takeBNBExact;
+            r.bnbRaised    += takeBNBExact;
+            totalTokensOut += tokensAtTake;
+            remainingBudget -= tokensAtTake;
+
+            // авто-затвори и напредувај ако се исполни капата
+            if (r.bnbRaised == r.bnbCap) {
+                r.closed = true;
+                if (idx == currentRound && currentRound + 1 < rounds.length) currentRound++;
+                idx++;
+            } else if (bnbLeft == 0 || remainingBudget == 0) {
+                break;
+            }
+        }
+
+        // испорака
+        if (totalTokensOut > 0) {
+            purchased[beneficiary] += totalTokensOut;
+            tokensSold             += totalTokensOut;
+            token.safeTransfer(beneficiary, totalTokensOut);
+            emit Purchased(beneficiary, totalBnbUsed, totalTokensOut, currentRound);
+        }
+
+        // рефунд
+        if (bnbLeft > 0) {
+            (bool ok, ) = payable(msg.sender).call{value: bnbLeft}("");
+            require(ok, "refund failed");
+            emit Refunded(msg.sender, bnbLeft);
+        }
+    }
+}
